@@ -1,0 +1,11 @@
+# Copy this file to local.properties and fill in your values.
+# Do NOT commit local.properties — it is listed in .gitignore.
+
+# Android SDK location (set automatically by Android Studio)
+sdk.dir=/path/to/your/Android/Sdk
+
+# Tuya / ThingClips credentials
+# Register at https://iot.tuya.com, create a Smart Home app project,
+# then copy the AppKey and AppSecret below.
+TUYA_APP_KEY=your_tuya_app_key_here
+TUYA_APP_SECRET=your_tuya_app_secret_here
