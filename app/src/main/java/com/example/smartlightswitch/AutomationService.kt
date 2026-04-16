@@ -7,14 +7,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.thingclips.smart.home.sdk.ThingHomeSdk
 import com.thingclips.smart.sdk.api.IDevListener
-import com.thingclips.smart.sdk.api.IResultCallback
 import com.thingclips.smart.sdk.api.IThingDevice
 import org.json.JSONObject
 
@@ -24,15 +21,13 @@ import org.json.JSONObject
  * Key behaviour:
  *  - When trigger fires → cancel any existing timer for that rule → start a fresh countdown
  *  - When cancel condition fires before the timer expires → cancel the timer
- *  - Timers survive the app being backgrounded (service is START_STICKY)
- *  - Timers do NOT survive the service being killed (acceptable – the next event restarts them)
+ *  - Timers survive process death and Doze mode (backed by AlarmManager)
+ *  - Active alarm IDs are tracked in-memory so the notification counter stays accurate
  */
 class AutomationService : Service() {
 
-    private val handler = Handler(Looper.getMainLooper())
-
-    // ruleId  →  pending Runnable (kept so we can cancel by reference)
-    private val pendingTimers = HashMap<String, Runnable>()
+    // ruleId → true when an alarm is pending (used only for notification counter)
+    private val pendingTimers = HashSet<String>()
 
     // devId   →  IThingDevice instance with a registered listener
     private val deviceInstances = HashMap<String, IThingDevice>()
@@ -73,7 +68,6 @@ class AutomationService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        pendingTimers.values.forEach { handler.removeCallbacks(it) }
         pendingTimers.clear()
         deviceInstances.values.forEach { runCatching { it.unRegisterDevListener() } }
         deviceInstances.clear()
@@ -127,20 +121,11 @@ class AutomationService : Service() {
             when {
                 // ── Trigger fired → restart timer ──────────────────────────
                 dpBool == rule.triggerValue -> {
-                    cancelTimer(rule.id)
+                    cancelTimer(rule)
                     val delayMs = rule.delayMinutes * 60_000L
                     Log.d(TAG, "Rule '${rule.name}' triggered. Timer: ${rule.delayMinutes} min")
-                    val runnable = Runnable {
-                        Log.d(TAG, "Rule '${rule.name}' timer elapsed – executing action")
-                        executeAction(rule)
-                        pendingTimers.remove(rule.id)
-                        updateNotification(
-                            AutomationRepository.getRules(this).count { it.enabled },
-                            pendingTimers.size
-                        )
-                    }
-                    pendingTimers[rule.id] = runnable
-                    handler.postDelayed(runnable, delayMs)
+                    AutomationAlarmReceiver.schedule(this, rule, delayMs)
+                    pendingTimers.add(rule.id)
                     updateNotification(
                         AutomationRepository.getRules(this).count { it.enabled },
                         pendingTimers.size
@@ -149,9 +134,9 @@ class AutomationService : Service() {
 
                 // ── Cancel condition met → stop timer ──────────────────────
                 dpBool == rule.cancelValue && rule.cancelDp == rule.triggerDp
-                        && pendingTimers.containsKey(rule.id) -> {
+                        && pendingTimers.contains(rule.id) -> {
                     Log.d(TAG, "Rule '${rule.name}' cancelled (device changed before timer)")
-                    cancelTimer(rule.id)
+                    cancelTimer(rule)
                     updateNotification(
                         AutomationRepository.getRules(this).count { it.enabled },
                         pendingTimers.size
@@ -161,25 +146,9 @@ class AutomationService : Service() {
         }
     }
 
-    private fun cancelTimer(ruleId: String) {
-        pendingTimers[ruleId]?.let { handler.removeCallbacks(it) }
-        pendingTimers.remove(ruleId)
-    }
-
-    // ── Action execution ───────────────────────────────────────────────────────
-
-    private fun executeAction(rule: AutomationRule) {
-        val instance = deviceInstances[rule.deviceId]
-            ?: ThingHomeSdk.newDeviceInstance(rule.deviceId)
-        val dpJson = JSONObject().put(rule.actionDp, rule.actionValue).toString()
-        instance.publishDps(dpJson, object : IResultCallback {
-            override fun onSuccess() {
-                Log.d(TAG, "Action for '${rule.name}' succeeded")
-            }
-            override fun onError(code: String?, error: String?) {
-                Log.e(TAG, "Action for '${rule.name}' failed: $error ($code)")
-            }
-        })
+    private fun cancelTimer(rule: AutomationRule) {
+        AutomationAlarmReceiver.cancel(this, rule)
+        pendingTimers.remove(rule.id)
     }
 
     // ── Notification ───────────────────────────────────────────────────────────
